@@ -1,0 +1,5 @@
+# Exclude CLAUDE.md and hidden files/directories (keep .gitignore and .git)
+CLAUDE.md
+.*
+!.gitignore
+!.git
