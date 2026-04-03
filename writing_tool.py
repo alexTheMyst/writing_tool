@@ -232,24 +232,12 @@ Corrected:
 """
 
 _NUANCE_PROMPT = """\
-You are an English tutor helping a non-native speaker learn natural English.
+You are an English tutor. Find every phrasal verb and idiomatic expression in the text below.
 
-Scan the ENTIRE text below from start to finish. Find EVERY phrasal verb, idiom, slang term, colloquialism, fixed expression, or informal grammar pattern. Do NOT stop after the first match — list ALL of them.
-Skip anything that is plain standard English with no special nuance.
+If none are found, output exactly: NONE
 
-How to extract a phrase:
-- Copy it EXACTLY as it appears in the text, including the conjugated/inflected form (e.g. "stepping away from", not "step away from"; "feeling under the weather", not "feel under the weather").
-- Do NOT normalise to base form.
-
-If no qualifying phrases are found, output exactly: NONE
-
-For each item output one bullet with ALL of the following on a single line:
-- <exact phrase as it appears in the text> — <category> — <meaning> — <usage note> — Example: <one natural sentence using the phrase in a different context>
-
-Categories include: phrasal verb, idiom, slang, colloquialism, fixed expression, informal grammar.
-
-Output plain text only — no markdown headers.
-Use a dash (-) for each bullet.
+For each one output a single bullet:
+- <exact phrase as it appears> — <meaning>
 
 Text:
 {text}\
@@ -371,10 +359,10 @@ def _run_learn_card(text: str) -> None:
     try:
         explanation = generate_nuance_explanation(text)
         if not explanation or explanation.strip().upper() == "NONE":
-            logging.debug("Anki: no nuances found, skipping card")
-            notify("Writing Tool — Learn", "Nothing interesting found in that text.")
-            return
-        back_html = explanation.replace("\n", "<br>")
+            logging.debug("Anki: no nuances found, using fallback back")
+            back_html = "(no explanation available — added manually)"
+        else:
+            back_html = explanation.replace("\n", "<br>")
         if create_anki_card(text, back_html, deck=ANKI_VOCAB_DECK):
             notify("Writing Tool — Learn", f'Vocab card added to "{ANKI_VOCAB_DECK}"')
         else:

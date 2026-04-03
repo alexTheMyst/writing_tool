@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import requests
 
 import writing_tool as wt
-from writing_tool import WritingToolApp, MODES, SYSTEM_PROMPT, rewrite, rewrite_multiple, generate_nuance_explanation
+from writing_tool import WritingToolApp, MODES, SYSTEM_PROMPT, rewrite, rewrite_multiple, generate_nuance_explanation, _run_learn_card
 
 
 # ──────────────────────────────────────────────────────────────
@@ -476,6 +476,65 @@ class TestNuance(unittest.TestCase):
     def test_request_exception_returns_empty_string(self, _mock_post):
         result = generate_nuance_explanation("Some text here.")
         self.assertEqual(result, "")
+
+
+
+# ──────────────────────────────────────────────────────────────
+# _run_learn_card() — always creates card regardless of explanation
+# ──────────────────────────────────────────────────────────────
+
+class TestRunLearnCard(unittest.TestCase):
+
+    def _anki_mock(self):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"result": 12345, "error": None}
+        return resp
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool.requests.post")
+    def test_card_created_when_explanation_succeeds(self, mock_post, mock_notify):
+        """Normal path: explanation → card created with explanation as back."""
+        mock_post.side_effect = [
+            _mock_ollama_response("- speak up — phrasal verb — to say something"),
+            self._anki_mock(),  # createDeck
+            self._anki_mock(),  # addNote
+        ]
+        _run_learn_card("how do I speak up?")
+        self.assertTrue(any(
+            call.args and "Vocab card added" in str(call.args)
+            for call in mock_notify.call_args_list
+        ))
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool.requests.post")
+    def test_card_created_when_explanation_times_out(self, mock_post, mock_notify):
+        """Timeout path: Ollama fails → card still created with fallback back."""
+        mock_post.side_effect = [
+            requests.RequestException("Read timed out"),  # nuance call
+            self._anki_mock(),  # createDeck
+            self._anki_mock(),  # addNote
+        ]
+        _run_learn_card("how do I speak up or talk about my accomplishments?")
+        self.assertTrue(any(
+            call.args and "Vocab card added" in str(call.args)
+            for call in mock_notify.call_args_list
+        ))
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool.requests.post")
+    def test_card_created_when_explanation_returns_none(self, mock_post, mock_notify):
+        """NONE path: model says no phrases → card still created with fallback back."""
+        mock_post.side_effect = [
+            _mock_ollama_response("NONE"),  # nuance call
+            self._anki_mock(),  # createDeck
+            self._anki_mock(),  # addNote
+        ]
+        _run_learn_card("I went to the store.")
+        self.assertTrue(any(
+            call.args and "Vocab card added" in str(call.args)
+            for call in mock_notify.call_args_list
+        ))
 
 
 # ──────────────────────────────────────────────────────────────
