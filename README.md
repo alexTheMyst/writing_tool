@@ -90,9 +90,14 @@ A **✎** icon appears in the menu bar. No Accessibility permission required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `BACKEND` | `ollama` | LLM backend: `ollama`, `openai`, or `anthropic` |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `qwen3.5:9b` | Model name |
+| `OLLAMA_MODEL` | `qwen3.5:9b` | Ollama model name |
 | `OLLAMA_TIMEOUT` | `120` | Request timeout in seconds |
+| `OPENAI_API_KEY` | *(required)* | OpenAI API key — required when `BACKEND=openai` |
+| `OPENAI_MODEL` | `gpt-4o` | OpenAI model name |
+| `ANTHROPIC_API_KEY` | *(required)* | Anthropic API key — required when `BACKEND=anthropic` |
+| `ANTHROPIC_MODEL` | `claude-3-5-sonnet-20241022` | Anthropic model name |
 | `ANKI_ENABLED` | `1` | Set to `0` to disable Anki integration |
 | `ANKI_URL` | `http://127.0.0.1:8765` | AnkiConnect plugin URL |
 | `ANKI_DECK` | `Writing Errors` | Deck for grammar/style correction cards |

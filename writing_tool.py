@@ -38,6 +38,12 @@ MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
 # Timeout in seconds — CPU inference can be slow, so be generous
 TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
+# Backend selection: "ollama" (default), "openai", or "anthropic"
+BACKEND = os.environ.get("BACKEND", "ollama").lower()
+
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+
 # AnkiConnect — set ANKI_ENABLED=0 to disable
 ANKI_ENABLED = os.environ.get("ANKI_ENABLED", "1") == "1"
 ANKI_URL = os.environ.get("ANKI_URL", "http://127.0.0.1:8765")
@@ -145,23 +151,38 @@ def pick_result(options: list) -> str | None:
 
 
 # ──────────────────────────────────────────────────────────────
-# Ollama interaction
+# Model dispatcher
 # ──────────────────────────────────────────────────────────────
 
-def rewrite(text: str, instruction: str, temperature: float = 0.3) -> str:
-    """Send text to Ollama and return the rewritten version."""
-    prompt = f"{instruction}\n\nText to rewrite:\n{text}"
+def _call_model(
+    prompt: str,
+    system: str | None,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    """Call the configured LLM backend and return the response text, or '' on error."""
+    if BACKEND == "openai":
+        return _call_openai(prompt, system, temperature, max_tokens)
+    if BACKEND == "anthropic":
+        return _call_anthropic(prompt, system, temperature, max_tokens)
+    return _call_ollama(prompt, system, temperature, max_tokens)
+
+
+def _call_ollama(
+    prompt: str,
+    system: str | None,
+    temperature: float,
+    max_tokens: int,
+) -> str:
     payload = {
         "model": MODEL,
-        "system": SYSTEM_PROMPT,
         "prompt": prompt,
         "stream": False,
         "think": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": 1024,
-        },
+        "options": {"temperature": temperature, "num_predict": max_tokens},
     }
+    if system:
+        payload["system"] = system
     try:
         logging.debug("POST %s (timeout=%ds)", OLLAMA_URL, TIMEOUT)
         resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
@@ -171,42 +192,100 @@ def rewrite(text: str, instruction: str, temperature: float = 0.3) -> str:
         return result
     except requests.RequestException as e:
         logging.error("Ollama request failed: %s", e)
+        raise
+
+
+def _call_openai(
+    prompt: str,
+    system: str | None,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    import openai  # lazy import — only required when BACKEND=openai
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    client = openai.OpenAI()
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        result = (response.choices[0].message.content or "").strip()
+        logging.debug("OpenAI responded: %r", result[:120])
+        return result
+    except openai.OpenAIError as e:
+        logging.error("OpenAI request failed: %s", e)
+        raise
+
+
+def _call_anthropic(
+    prompt: str,
+    system: str | None,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    import anthropic  # lazy import — only required when BACKEND=anthropic
+    client = anthropic.Anthropic()
+    kwargs = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
+    try:
+        response = client.messages.create(**kwargs)
+        result = (response.content[0].text or "").strip()
+        logging.debug("Anthropic responded: %r", result[:120])
+        return result
+    except anthropic.APIError as e:
+        logging.error("Anthropic request failed: %s", e)
+        raise
+
+
+# ──────────────────────────────────────────────────────────────
+# Ollama interaction
+# ──────────────────────────────────────────────────────────────
+
+def rewrite(text: str, instruction: str, temperature: float = 0.3) -> str:
+    """Send text to the configured LLM backend and return the rewritten version."""
+    prompt = f"{instruction}\n\nText to rewrite:\n{text}"
+    try:
+        return _call_model(prompt, SYSTEM_PROMPT, temperature, 1024)
+    except Exception as e:
+        logging.error("Rewrite failed: %s", e)
         notify("Writing Tool — Error", str(e))
         return ""
 
 
 def rewrite_multiple(text: str, instruction: str, n: int, temperature: float) -> list:
-    """Ask Ollama for n numbered variants. Returns a list of strings (may be shorter than n on parse failure)."""
+    """Ask the LLM for n numbered variants. Returns a list of strings (may be shorter than n on parse failure)."""
     prompt = (
         f"{instruction}\n\n"
         f"Provide exactly {n} different rewrites, numbered 1. 2. 3. "
         f"Put a blank line between each. Output only the numbered rewrites, nothing else.\n\n"
         f"Text:\n{text}"
     )
-    payload = {
-        "model": MODEL,
-        "system": SYSTEM_PROMPT,
-        "prompt": prompt,
-        "stream": False,
-        "think": False,
-        "options": {"temperature": temperature, "num_predict": 1024},
-    }
     try:
-        logging.debug("POST %s (timeout=%ds, n=%d)", OLLAMA_URL, TIMEOUT, n)
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
-        resp.raise_for_status()
-        raw = resp.json().get("response", "").strip()
-        logging.debug("Ollama responded: %r", raw[:300])
-        variants = re.findall(r'(?m)^\d+\.\s+([\s\S]+?)(?=\n\s*\d+\.|\s*$)', raw)
-        variants = [v.strip() for v in variants if v.strip()]
-        if len(variants) != n:
-            logging.warning("Expected %d variants, parsed %d — falling back to raw", n, len(variants))
-            return [raw] if raw else []
-        return variants
-    except requests.RequestException as e:
-        logging.error("Ollama request failed: %s", e)
+        raw = _call_model(prompt, SYSTEM_PROMPT, temperature, 1024)
+    except Exception as e:
+        logging.error("Rewrite failed: %s", e)
         notify("Writing Tool — Error", str(e))
         return []
+    if not raw:
+        return []
+    logging.debug("LLM responded: %r", raw[:300])
+    variants = re.findall(r'(?m)^\d+\.\s+([\s\S]+?)(?=\n\s*\d+\.|\s*$)', raw)
+    variants = [v.strip() for v in variants if v.strip()]
+    if len(variants) != n:
+        logging.warning("Expected %d variants, parsed %d — falling back to raw", n, len(variants))
+        return [raw]
+    return variants
 
 
 # ──────────────────────────────────────────────────────────────
@@ -232,7 +311,13 @@ Corrected:
 """
 
 _NUANCE_PROMPT = """\
-You are an English tutor. Find every phrasal verb and idiomatic expression in the text below.
+You are an English tutor helping a non-native speaker learn natural English.
+
+Find every phrase in the text below that is worth explaining to a learner:
+- Phrasal verbs (e.g. "speak up", "give away")
+- Idiomatic expressions (e.g. "break a leg")
+- Common collocations — natural word pairings that may not be obvious (e.g. "naturally loud", "make a decision")
+- Informal or colloquial expressions
 
 If none are found, output exactly: NONE
 
@@ -245,43 +330,25 @@ Text:
 
 
 def generate_explanation(original: str, corrected: str) -> str:
-    """Ask Ollama to explain the differences between original and corrected text."""
+    """Ask the LLM to explain the differences between original and corrected text."""
     prompt = _ANKI_EXPLANATION_PROMPT.format(original=original, corrected=corrected)
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0.1, "num_predict": 512},
-    }
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
-        resp.raise_for_status()
-        raw = resp.json().get("response", "").strip()
+        raw = _call_model(prompt, None, 0.1, 512)
         logging.debug("Anki explanation raw response: %r", raw[:300])
         return raw
-    except requests.RequestException as e:
+    except Exception as e:
         logging.warning("Explanation request failed: %s", e)
         return ""
 
 
 def generate_nuance_explanation(text: str) -> str:
-    """Ask Ollama to explain phrasal verbs, idioms, slang, and other nuances in text."""
+    """Ask the LLM to find phrasal verbs, idioms, collocations, and informal expressions in text."""
     prompt = _NUANCE_PROMPT.format(text=text)
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0.1, "num_predict": 1024},
-    }
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
-        resp.raise_for_status()
-        raw = resp.json().get("response", "").strip()
+        raw = _call_model(prompt, None, 0.1, 1024)
         logging.debug("Nuance explanation raw response: %r", raw[:300])
         return raw
-    except requests.RequestException as e:
+    except Exception as e:
         logging.warning("Nuance explanation request failed: %s", e)
         return ""
 
@@ -500,11 +567,11 @@ class WritingToolApp(rumps.App):
                 logging.warning("Clipboard is empty")
                 notify("Writing Tool", "Clipboard is empty — copy some text first.")
                 return
-            logging.info("Sending to Ollama: model=%s mode=%s chars=%d", MODEL, mode_name or "custom", len(original))
+            logging.info("Sending to LLM backend=%s mode=%s chars=%d", BACKEND, mode_name or "custom", len(original))
             variants = rewrite_multiple(original, instruction, n=3, temperature=temperature)
             if not variants:
-                logging.error("Ollama returned no results")
-                notify("Writing Tool", "No result — check Ollama is running.")
+                logging.error("LLM returned no results")
+                notify("Writing Tool", "No result — check your LLM backend is reachable.")
                 return
             logging.info("Got %d variants, showing picker", len(variants))
             chosen = pick_result(variants)
@@ -529,5 +596,6 @@ class WritingToolApp(rumps.App):
 # ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.info("Starting Writing Tool — model=%s ollama=%s", MODEL, OLLAMA_HOST)
+    _active_model = {"ollama": MODEL, "openai": OPENAI_MODEL, "anthropic": ANTHROPIC_MODEL}.get(BACKEND, MODEL)
+    logging.info("Starting Writing Tool — backend=%s model=%s", BACKEND, _active_model)
     WritingToolApp().run()

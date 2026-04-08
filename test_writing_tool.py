@@ -1,7 +1,7 @@
 """
 Tests for writing_tool.py.
 
-Tests the full pipeline: clipboard read → Ollama API call → picker → clipboard write,
+Tests the full pipeline: clipboard read → LLM API call → picker → clipboard write,
 using mocked HTTP requests so no real Ollama instance is required.
 
 Run with:
@@ -535,6 +535,124 @@ class TestRunLearnCard(unittest.TestCase):
             call.args and "Vocab card added" in str(call.args)
             for call in mock_notify.call_args_list
         ))
+
+
+# ──────────────────────────────────────────────────────────────
+# Backend dispatch — _call_model() routing tests
+# ──────────────────────────────────────────────────────────────
+
+class TestBackendDispatch(unittest.TestCase):
+
+    @patch("writing_tool._call_openai", return_value="openai result")
+    def test_dispatches_to_openai(self, mock_fn):
+        with patch("writing_tool.BACKEND", "openai"):
+            result = wt._call_model("prompt", "system", 0.5, 512)
+        self.assertEqual(result, "openai result")
+        mock_fn.assert_called_once_with("prompt", "system", 0.5, 512)
+
+    @patch("writing_tool._call_anthropic", return_value="anthropic result")
+    def test_dispatches_to_anthropic(self, mock_fn):
+        with patch("writing_tool.BACKEND", "anthropic"):
+            result = wt._call_model("prompt", "system", 0.5, 512)
+        self.assertEqual(result, "anthropic result")
+        mock_fn.assert_called_once_with("prompt", "system", 0.5, 512)
+
+    @patch("writing_tool._call_ollama", return_value="ollama result")
+    def test_dispatches_to_ollama_by_default(self, mock_fn):
+        with patch("writing_tool.BACKEND", "ollama"):
+            result = wt._call_model("prompt", "system", 0.5, 512)
+        self.assertEqual(result, "ollama result")
+        mock_fn.assert_called_once_with("prompt", "system", 0.5, 512)
+
+
+# ──────────────────────────────────────────────────────────────
+# OpenAI backend — rewrite() routing
+# ──────────────────────────────────────────────────────────────
+
+class TestOpenAIBackend(unittest.TestCase):
+
+    @patch("writing_tool._call_openai", return_value="rewritten via openai")
+    def test_rewrite_routes_to_openai(self, mock_call):
+        with patch("writing_tool.BACKEND", "openai"):
+            result = rewrite("my text", "Make better.")
+        self.assertEqual(result, "rewritten via openai")
+        prompt, system, temperature, max_tokens = mock_call.call_args[0]
+        self.assertIn("my text", prompt)
+        self.assertEqual(system, wt.SYSTEM_PROMPT)
+        self.assertEqual(max_tokens, 1024)
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool._call_openai", side_effect=Exception("API key missing"))
+    def test_openai_error_returns_empty_string(self, _mock_call, mock_notify):
+        with patch("writing_tool.BACKEND", "openai"):
+            result = rewrite("my text", "Make better.")
+        self.assertEqual(result, "")
+        mock_notify.assert_called_once()
+        title, _ = mock_notify.call_args[0]
+        self.assertIn("Error", title)
+
+    @patch("writing_tool._call_openai", return_value="nuance result")
+    def test_generate_nuance_uses_openai(self, mock_call):
+        with patch("writing_tool.BACKEND", "openai"):
+            result = wt.generate_nuance_explanation("speak up")
+        self.assertEqual(result, "nuance result")
+        _prompt, system, _temp, max_tokens = mock_call.call_args[0]
+        self.assertIsNone(system)
+        self.assertEqual(max_tokens, 1024)
+
+    @patch("writing_tool._call_openai", return_value="explanation")
+    def test_generate_explanation_uses_openai(self, mock_call):
+        with patch("writing_tool.BACKEND", "openai"):
+            result = wt.generate_explanation("original", "corrected")
+        self.assertEqual(result, "explanation")
+        _prompt, system, _temp, max_tokens = mock_call.call_args[0]
+        self.assertIsNone(system)
+        self.assertEqual(max_tokens, 512)
+
+
+# ──────────────────────────────────────────────────────────────
+# Anthropic backend — rewrite() routing
+# ──────────────────────────────────────────────────────────────
+
+class TestAnthropicBackend(unittest.TestCase):
+
+    @patch("writing_tool._call_anthropic", return_value="rewritten via anthropic")
+    def test_rewrite_routes_to_anthropic(self, mock_call):
+        with patch("writing_tool.BACKEND", "anthropic"):
+            result = rewrite("my text", "Make better.")
+        self.assertEqual(result, "rewritten via anthropic")
+        prompt, system, temperature, max_tokens = mock_call.call_args[0]
+        self.assertIn("my text", prompt)
+        self.assertEqual(system, wt.SYSTEM_PROMPT)
+        self.assertEqual(max_tokens, 1024)
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool._call_anthropic", side_effect=Exception("API key missing"))
+    def test_anthropic_error_returns_empty_string(self, _mock_call, mock_notify):
+        with patch("writing_tool.BACKEND", "anthropic"):
+            result = rewrite("my text", "Make better.")
+        self.assertEqual(result, "")
+        mock_notify.assert_called_once()
+        title, _ = mock_notify.call_args[0]
+        self.assertIn("Error", title)
+
+    @patch("writing_tool._call_anthropic", return_value="nuance result")
+    def test_generate_nuance_uses_anthropic(self, mock_call):
+        with patch("writing_tool.BACKEND", "anthropic"):
+            result = wt.generate_nuance_explanation("speak up")
+        self.assertEqual(result, "nuance result")
+        _prompt, system, _temp, max_tokens = mock_call.call_args[0]
+        self.assertIsNone(system)
+        self.assertEqual(max_tokens, 1024)
+
+    @patch("writing_tool._call_anthropic", return_value="explanation")
+    def test_generate_explanation_uses_anthropic(self, mock_call):
+        with patch("writing_tool.BACKEND", "anthropic"):
+            result = wt.generate_explanation("original", "corrected")
+        self.assertEqual(result, "explanation")
+        _prompt, system, _temp, max_tokens = mock_call.call_args[0]
+        self.assertIsNone(system)
+        self.assertEqual(max_tokens, 512)
 
 
 # ──────────────────────────────────────────────────────────────
