@@ -3,5 +3,6 @@ CLAUDE.md
 .*
 !.gitignore
 !.git
+!.github
 !__pycache__
 

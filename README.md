@@ -25,6 +25,7 @@ Runs entirely on your own hardware. No data leaves your network.
 | Make Direct | Lead with the ask, cut the build-up |
 | Custom… | Enter any rewrite instruction on the fly |
 | Learn This | Explains phrasal verbs, idioms, and nuances in the copied text (saves to Anki) |
+| Practice Weak Spots | Analyzes your Writing Errors deck, identifies recurring mistake patterns, and generates sentence-correction exercises |
 
 ## Setup
 
@@ -102,11 +103,14 @@ A **✎** icon appears in the menu bar. No Accessibility permission required.
 | `ANKI_URL` | `http://127.0.0.1:8765` | AnkiConnect plugin URL |
 | `ANKI_DECK` | `Writing Errors` | Deck for grammar/style correction cards |
 | `ANKI_VOCAB_DECK` | `English Vocabulary` | Deck for vocabulary/idiom cards (Learn This) |
+| `ANKI_EXERCISE_DECK` | `Writing Exercises` | Deck for generated practice exercises (Practice Weak Spots) |
 | `ANKI_TIMEOUT` | `5` | AnkiConnect request timeout in seconds |
 
 ## Anki integration
 
 When you pick a rewritten variant, the tool automatically creates an [Anki](https://apps.ankiweb.net) flashcard showing the original text on the front and the corrected version (with an AI-generated explanation of the changes) on the back. The **Learn This** menu item creates a vocabulary card listing any phrasal verbs, idioms, and colloquialisms found in the copied text.
+
+The **Practice Weak Spots** menu item analyzes all cards in your Writing Errors deck, uses the LLM to identify recurring error patterns (e.g. missing articles, wrong prepositions), and generates sentence-correction exercise cards in a separate "Writing Exercises" deck. The number of exercises scales with the number of patterns found.
 
 **Requirement:** the [AnkiConnect](https://ankiweb.net/shared/info/2055492159) add-on must be installed in Anki (add-on code `2055492159`). Anki must be running for cards to be created — if it isn't, the tool silently skips card creation.
 

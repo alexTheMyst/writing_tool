@@ -49,6 +49,7 @@ ANKI_ENABLED = os.environ.get("ANKI_ENABLED", "1") == "1"
 ANKI_URL = os.environ.get("ANKI_URL", "http://127.0.0.1:8765")
 ANKI_DECK = os.environ.get("ANKI_DECK", "Writing Errors")
 ANKI_VOCAB_DECK = os.environ.get("ANKI_VOCAB_DECK", "English Vocabulary")
+ANKI_EXERCISE_DECK = os.environ.get("ANKI_EXERCISE_DECK", "Writing Exercises")
 ANKI_TIMEOUT = int(os.environ.get("ANKI_TIMEOUT", "5"))
 
 SYSTEM_PROMPT = (
@@ -439,6 +440,210 @@ def _run_learn_card(text: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
+# Error pattern analysis & exercise generation
+# ──────────────────────────────────────────────────────────────
+
+def fetch_deck_cards(deck: str = ANKI_DECK) -> list[dict]:
+    """Fetch all card fronts/backs from an Anki deck via AnkiConnect.
+
+    Returns a list of {"front": ..., "back": ...} dicts.
+    """
+    # Step 1: find all note IDs in the deck
+    find_payload = {
+        "action": "findNotes",
+        "version": 6,
+        "params": {"query": f'"deck:{deck}"'},
+    }
+    try:
+        resp = requests.post(ANKI_URL, json=find_payload, timeout=ANKI_TIMEOUT)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("error") is not None:
+            logging.warning("AnkiConnect findNotes error: %s", body["error"])
+            return []
+        note_ids = body.get("result", [])
+    except requests.RequestException as e:
+        logging.warning("AnkiConnect findNotes failed: %s", e)
+        return []
+
+    if not note_ids:
+        logging.info("No notes found in deck %r", deck)
+        return []
+
+    # Step 2: get note details
+    info_payload = {
+        "action": "notesInfo",
+        "version": 6,
+        "params": {"notes": note_ids},
+    }
+    try:
+        resp = requests.post(ANKI_URL, json=info_payload, timeout=ANKI_TIMEOUT)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("error") is not None:
+            logging.warning("AnkiConnect notesInfo error: %s", body["error"])
+            return []
+        notes = body.get("result", [])
+    except requests.RequestException as e:
+        logging.warning("AnkiConnect notesInfo failed: %s", e)
+        return []
+
+    cards = []
+    for note in notes:
+        fields = note.get("fields", {})
+        front = fields.get("Front", {}).get("value", "")
+        back = fields.get("Back", {}).get("value", "")
+        if front:
+            cards.append({"front": front, "back": back})
+    logging.info("Fetched %d cards from deck %r", len(cards), deck)
+    return cards
+
+
+_ANALYZE_PATTERNS_PROMPT = """\
+You are an English tutor analyzing a student's writing mistakes.
+
+Below are pairs of original text (with errors) and corrected text from past writing sessions.
+Identify the recurring error PATTERNS — not individual mistakes.
+
+Group them into categories like: Article errors, Preposition errors, Verb tense errors, \
+Word order errors, Spelling/typo patterns, Tone issues, etc.
+
+For each pattern:
+- Name it concisely
+- Describe what the student keeps getting wrong
+- Give 1-2 examples from the data
+
+Output format (one pattern per block, separated by blank lines):
+PATTERN: <name>
+DESCRIPTION: <what goes wrong>
+EXAMPLES: <1-2 brief examples from the data>
+
+If fewer than 3 cards are provided, still try to identify any patterns you can.
+If no clear patterns exist, output exactly: NO_PATTERNS
+
+Cards:
+{cards_text}\
+"""
+
+
+def analyze_error_patterns(cards: list[dict]) -> str:
+    """Send card data to the LLM and get back a description of recurring error patterns."""
+    cards_text = "\n\n".join(
+        f"Original: {c['front']}\nCorrected: {c['back']}"
+        for c in cards
+    )
+    prompt = _ANALYZE_PATTERNS_PROMPT.format(cards_text=cards_text)
+    try:
+        raw = _call_model(prompt, None, 0.2, 2048)
+        logging.debug("Pattern analysis response: %r", raw[:300])
+        return raw
+    except Exception as e:
+        logging.error("Pattern analysis failed: %s", e)
+        return ""
+
+
+_GENERATE_EXERCISES_PROMPT = """\
+You are an English tutor creating sentence-correction exercises.
+
+Based on the error patterns below, generate practice exercises. For each pattern, \
+create 1-2 exercises where the student must fix a sentence that contains that type of error.
+
+The exercises must use NEW sentences — do not copy from the examples.
+Make the sentences realistic (workplace Slack messages, emails, casual professional writing).
+
+Output format (one exercise per block, separated by blank lines):
+PATTERN: <which pattern this targets>
+BROKEN: <sentence with the error>
+FIXED: <corrected sentence>
+HINT: <short hint about what to look for>
+
+Error patterns:
+{patterns}\
+"""
+
+
+def generate_exercises(patterns: str) -> list[dict]:
+    """Ask the LLM to generate sentence-correction exercises for the given patterns.
+
+    Returns a list of {"pattern": ..., "broken": ..., "fixed": ..., "hint": ...} dicts.
+    """
+    prompt = _GENERATE_EXERCISES_PROMPT.format(patterns=patterns)
+    try:
+        raw = _call_model(prompt, None, 0.5, 2048)
+    except Exception as e:
+        logging.error("Exercise generation failed: %s", e)
+        return []
+    if not raw:
+        return []
+    logging.debug("Exercise generation response: %r", raw[:300])
+
+    exercises = []
+    blocks = re.split(r'\n\s*\n', raw)
+    for block in blocks:
+        pattern_m = re.search(r'PATTERN:\s*(.+)', block)
+        broken_m = re.search(r'BROKEN:\s*(.+)', block)
+        fixed_m = re.search(r'FIXED:\s*(.+)', block)
+        hint_m = re.search(r'HINT:\s*(.+)', block)
+        if broken_m and fixed_m:
+            exercises.append({
+                "pattern": pattern_m.group(1).strip() if pattern_m else "General",
+                "broken": broken_m.group(1).strip(),
+                "fixed": fixed_m.group(1).strip(),
+                "hint": hint_m.group(1).strip() if hint_m else "",
+            })
+    logging.info("Parsed %d exercises", len(exercises))
+    return exercises
+
+
+def create_exercise_cards(exercises: list[dict], deck: str = ANKI_EXERCISE_DECK) -> int:
+    """Create sentence-correction exercise cards in Anki. Returns number of cards created."""
+    created = 0
+    for ex in exercises:
+        front = (
+            f"<b>Fix this sentence:</b><br><br>"
+            f"{ex['broken']}"
+        )
+        if ex.get("hint"):
+            front += f"<br><br><small>Hint: {ex['hint']}</small>"
+        back = (
+            f"{ex['fixed']}<br><br>"
+            f"<small>Pattern: {ex['pattern']}</small>"
+        )
+        if create_anki_card(front, back, deck=deck):
+            created += 1
+    return created
+
+
+def _run_practice_generation() -> None:
+    """Full pipeline: fetch cards → analyze patterns → generate exercises → create cards."""
+    try:
+        cards = fetch_deck_cards(ANKI_DECK)
+        if not cards:
+            notify("Writing Tool", "No cards found in your Writing Errors deck.")
+            return
+
+        notify("Writing Tool", f"Analyzing {len(cards)} cards for patterns…")
+        patterns = analyze_error_patterns(cards)
+        if not patterns or patterns.strip() == "NO_PATTERNS":
+            notify("Writing Tool", "No clear error patterns found yet — keep writing!")
+            return
+
+        exercises = generate_exercises(patterns)
+        if not exercises:
+            notify("Writing Tool", "Could not generate exercises — try again later.")
+            return
+
+        created = create_exercise_cards(exercises)
+        notify(
+            "Writing Tool — Practice",
+            f"Created {created} exercise card{'s' if created != 1 else ''} "
+            f'in "{ANKI_EXERCISE_DECK}"',
+        )
+    except Exception:
+        logging.exception("Unexpected error in practice generation")
+
+
+# ──────────────────────────────────────────────────────────────
 # Menu bar app
 # ──────────────────────────────────────────────────────────────
 
@@ -462,6 +667,8 @@ class WritingToolApp(rumps.App):
         menu_items.append(rumps.MenuItem("Custom…", callback=self._custom_callback))
         menu_items.append(None)  # separator
         menu_items.append(rumps.MenuItem("Learn This", callback=self._learn_callback))
+        menu_items.append(None)  # separator
+        menu_items.append(rumps.MenuItem("Practice Weak Spots", callback=self._practice_callback))
 
         super().__init__(
             name="Writing Tool",
@@ -536,6 +743,29 @@ class WritingToolApp(rumps.App):
             self.processing = True
         self._start_spinner()
         threading.Thread(target=self._process_learn, daemon=True).start()
+
+    def _practice_callback(self, sender):
+        logging.info("Menu clicked: Practice Weak Spots")
+        if not ANKI_ENABLED:
+            notify("Writing Tool", "Anki integration is disabled.")
+            return
+        with self.lock:
+            if self.processing:
+                logging.warning("Already processing, ignoring click")
+                notify("Writing Tool", "Already processing — please wait.")
+                return
+            self.processing = True
+        self._start_spinner()
+        threading.Thread(target=self._process_practice, daemon=True).start()
+
+    def _process_practice(self):
+        try:
+            _run_practice_generation()
+        except Exception:
+            logging.exception("Unexpected error in _process_practice")
+        finally:
+            self._stop_spinner()
+            self.processing = False
 
     def _process_learn(self):
         try:

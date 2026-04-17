@@ -17,7 +17,12 @@ from unittest.mock import MagicMock, patch
 import requests
 
 import writing_tool as wt
-from writing_tool import WritingToolApp, MODES, SYSTEM_PROMPT, rewrite, rewrite_multiple, generate_nuance_explanation, _run_learn_card
+from writing_tool import (
+    WritingToolApp, MODES, SYSTEM_PROMPT, rewrite, rewrite_multiple,
+    generate_nuance_explanation, _run_learn_card,
+    fetch_deck_cards, analyze_error_patterns, generate_exercises,
+    create_exercise_cards, _run_practice_generation,
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -653,6 +658,233 @@ class TestAnthropicBackend(unittest.TestCase):
         _prompt, system, _temp, max_tokens = mock_call.call_args[0]
         self.assertIsNone(system)
         self.assertEqual(max_tokens, 512)
+
+
+# ──────────────────────────────────────────────────────────────
+# fetch_deck_cards() — AnkiConnect integration
+# ──────────────────────────────────────────────────────────────
+
+class TestFetchDeckCards(unittest.TestCase):
+
+    def _anki_response(self, result, error=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"result": result, "error": error}
+        return resp
+
+    @patch("writing_tool.requests.post")
+    def test_returns_cards_from_deck(self, mock_post):
+        mock_post.side_effect = [
+            self._anki_response([111, 222]),
+            self._anki_response([
+                {"fields": {"Front": {"value": "original 1"}, "Back": {"value": "corrected 1"}}},
+                {"fields": {"Front": {"value": "original 2"}, "Back": {"value": "corrected 2"}}},
+            ]),
+        ]
+        cards = fetch_deck_cards("Writing Errors")
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(cards[0]["front"], "original 1")
+        self.assertEqual(cards[1]["back"], "corrected 2")
+
+    @patch("writing_tool.requests.post")
+    def test_returns_empty_list_when_no_notes(self, mock_post):
+        mock_post.return_value = self._anki_response([])
+        cards = fetch_deck_cards("Empty Deck")
+        self.assertEqual(cards, [])
+
+    @patch("writing_tool.requests.post",
+           side_effect=requests.RequestException("connection refused"))
+    def test_returns_empty_list_on_connection_error(self, _mock):
+        cards = fetch_deck_cards("Writing Errors")
+        self.assertEqual(cards, [])
+
+    @patch("writing_tool.requests.post")
+    def test_skips_cards_with_empty_front(self, mock_post):
+        mock_post.side_effect = [
+            self._anki_response([111]),
+            self._anki_response([
+                {"fields": {"Front": {"value": ""}, "Back": {"value": "something"}}},
+            ]),
+        ]
+        cards = fetch_deck_cards("Writing Errors")
+        self.assertEqual(cards, [])
+
+
+# ──────────────────────────────────────────────────────────────
+# analyze_error_patterns() — LLM pattern analysis
+# ──────────────────────────────────────────────────────────────
+
+class TestAnalyzeErrorPatterns(unittest.TestCase):
+
+    @patch("writing_tool.requests.post")
+    def test_returns_pattern_analysis(self, mock_post):
+        mock_post.return_value = _mock_ollama_response(
+            "PATTERN: Article errors\nDESCRIPTION: Missing articles\nEXAMPLES: 'go to store' → 'go to the store'"
+        )
+        result = analyze_error_patterns([{"front": "go to store", "back": "go to the store"}])
+        self.assertIn("Article errors", result)
+
+    @patch("writing_tool.requests.post",
+           side_effect=requests.RequestException("timeout"))
+    def test_returns_empty_string_on_error(self, _mock):
+        result = analyze_error_patterns([{"front": "x", "back": "y"}])
+        self.assertEqual(result, "")
+
+
+# ──────────────────────────────────────────────────────────────
+# generate_exercises() — LLM exercise generation and parsing
+# ──────────────────────────────────────────────────────────────
+
+class TestGenerateExercises(unittest.TestCase):
+
+    @patch("writing_tool.requests.post")
+    def test_parses_exercise_blocks(self, mock_post):
+        raw = (
+            "PATTERN: Article errors\n"
+            "BROKEN: I went to store yesterday.\n"
+            "FIXED: I went to the store yesterday.\n"
+            "HINT: Look for missing articles.\n"
+            "\n"
+            "PATTERN: Preposition errors\n"
+            "BROKEN: I'm good in cooking.\n"
+            "FIXED: I'm good at cooking.\n"
+            "HINT: Check the preposition after adjectives."
+        )
+        mock_post.return_value = _mock_ollama_response(raw)
+        exercises = generate_exercises("some patterns")
+        self.assertEqual(len(exercises), 2)
+        self.assertEqual(exercises[0]["pattern"], "Article errors")
+        self.assertEqual(exercises[0]["broken"], "I went to store yesterday.")
+        self.assertEqual(exercises[0]["fixed"], "I went to the store yesterday.")
+        self.assertEqual(exercises[0]["hint"], "Look for missing articles.")
+        self.assertEqual(exercises[1]["pattern"], "Preposition errors")
+
+    @patch("writing_tool.requests.post")
+    def test_returns_empty_list_on_unparseable_response(self, mock_post):
+        mock_post.return_value = _mock_ollama_response("Here are some thoughts...")
+        exercises = generate_exercises("patterns")
+        self.assertEqual(exercises, [])
+
+    @patch("writing_tool.requests.post",
+           side_effect=requests.RequestException("timeout"))
+    def test_returns_empty_list_on_error(self, _mock):
+        exercises = generate_exercises("patterns")
+        self.assertEqual(exercises, [])
+
+
+# ──────────────────────────────────────────────────────────────
+# create_exercise_cards() — Anki card creation
+# ──────────────────────────────────────────────────────────────
+
+class TestCreateExerciseCards(unittest.TestCase):
+
+    def _anki_mock(self):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"result": 12345, "error": None}
+        return resp
+
+    @patch("writing_tool.requests.post")
+    def test_creates_cards_for_each_exercise(self, mock_post):
+        mock_post.return_value = self._anki_mock()
+        exercises = [
+            {"pattern": "Articles", "broken": "Go to store.", "fixed": "Go to the store.", "hint": "Missing article"},
+            {"pattern": "Prepositions", "broken": "Good in it.", "fixed": "Good at it.", "hint": "Wrong preposition"},
+        ]
+        created = create_exercise_cards(exercises)
+        self.assertEqual(created, 2)
+
+    @patch("writing_tool.requests.post",
+           side_effect=requests.exceptions.ConnectionError("not running"))
+    def test_returns_zero_when_anki_not_running(self, _mock):
+        exercises = [{"pattern": "X", "broken": "a", "fixed": "b", "hint": "c"}]
+        created = create_exercise_cards(exercises)
+        self.assertEqual(created, 0)
+
+
+# ──────────────────────────────────────────────────────────────
+# _run_practice_generation() — full pipeline
+# ──────────────────────────────────────────────────────────────
+
+class TestPracticeGeneration(unittest.TestCase):
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool.create_exercise_cards", return_value=3)
+    @patch("writing_tool.generate_exercises", return_value=[{"pattern": "A", "broken": "b", "fixed": "f", "hint": "h"}])
+    @patch("writing_tool.analyze_error_patterns", return_value="PATTERN: Articles\nDESCRIPTION: Missing articles")
+    @patch("writing_tool.fetch_deck_cards", return_value=[{"front": "x", "back": "y"}])
+    def test_full_pipeline_creates_cards(self, _fetch, _analyze, _gen, mock_create, mock_notify):
+        _run_practice_generation()
+        mock_create.assert_called_once()
+        self.assertTrue(any("Created 3" in str(c) for c in mock_notify.call_args_list))
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool.fetch_deck_cards", return_value=[])
+    def test_empty_deck_notifies_user(self, _fetch, mock_notify):
+        _run_practice_generation()
+        mock_notify.assert_called_once()
+        self.assertIn("No cards found", mock_notify.call_args[0][1])
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool.analyze_error_patterns", return_value="NO_PATTERNS")
+    @patch("writing_tool.fetch_deck_cards", return_value=[{"front": "x", "back": "y"}])
+    def test_no_patterns_notifies_user(self, _fetch, _analyze, mock_notify):
+        _run_practice_generation()
+        self.assertTrue(any("No clear error patterns" in str(c) for c in mock_notify.call_args_list))
+
+    @patch("writing_tool.notify")
+    @patch("writing_tool.generate_exercises", return_value=[])
+    @patch("writing_tool.analyze_error_patterns", return_value="PATTERN: something")
+    @patch("writing_tool.fetch_deck_cards", return_value=[{"front": "x", "back": "y"}])
+    def test_no_exercises_notifies_user(self, _fetch, _analyze, _gen, mock_notify):
+        _run_practice_generation()
+        self.assertTrue(any("Could not generate" in str(c) for c in mock_notify.call_args_list))
+
+
+# ──────────────────────────────────────────────────────────────
+# Practice menu integration
+# ──────────────────────────────────────────────────────────────
+
+class TestPracticeMenuIntegration(unittest.TestCase):
+
+    def test_practice_callback_spawns_thread(self):
+        app = _make_app()
+        spawned = []
+        original_thread = threading.Thread
+
+        def tracking_thread(*args, **kwargs):
+            t = original_thread(*args, **kwargs)
+            spawned.append(t)
+            return t
+
+        with patch("writing_tool.threading.Thread", side_effect=tracking_thread), \
+             patch("writing_tool.notify"), \
+             patch("writing_tool.ANKI_ENABLED", True):
+            app._practice_callback(None)
+
+        self.assertEqual(len(spawned), 1)
+
+    def test_practice_callback_blocked_while_processing(self):
+        app = _make_app()
+        app.processing = True
+        spawned = []
+
+        def tracking_thread(*args, **kwargs):
+            spawned.append(True)
+            return MagicMock()
+
+        with patch("writing_tool.threading.Thread", side_effect=tracking_thread), \
+             patch("writing_tool.notify"):
+            app._practice_callback(None)
+
+        self.assertEqual(spawned, [])
+
+    def test_practice_callback_disabled_when_anki_off(self):
+        app = _make_app()
+        with patch("writing_tool.ANKI_ENABLED", False), \
+             patch("writing_tool.notify") as mock_notify:
+            app._practice_callback(None)
+        self.assertIn("disabled", mock_notify.call_args[0][1].lower())
 
 
 # ──────────────────────────────────────────────────────────────
