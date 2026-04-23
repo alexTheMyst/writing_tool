@@ -6,6 +6,9 @@
 # Activate the virtualenv first
 source .venv/bin/activate
 
+# pytest is NOT in requirements.txt — install it separately
+pip install pytest
+
 # Run all tests
 python -m pytest test_writing_tool.py -v
 
@@ -43,3 +46,5 @@ Menu callbacks acquire `self.lock` to set a `processing` flag, then spawn a daem
 - **Tests mock at the HTTP/function boundary** (`requests.post` or `_call_openai`/`_call_anthropic`) — never call a real LLM. The `_make_app()` helper creates a `WritingToolApp` without starting the rumps event loop.
 - **macOS-only**: the app depends on `osascript` for notifications and the picker dialog, and `rumps` for the menu bar. There are no cross-platform abstractions.
 - **Python type hints** use the `str | None` union syntax (Python 3.10+).
+- **`.gitignore` blocks dotfiles** — the `.*` pattern excludes all hidden dirs. `.github/` is explicitly allowlisted, but other dotfile dirs (e.g. `.vscode/`) will be ignored by default.
+- **Never stage `__pycache__/`** — the `.gitignore` allowlists it (legacy), so `git add -A` will pick up `.pyc` files. Exclude it explicitly when committing.

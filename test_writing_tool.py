@@ -290,6 +290,45 @@ class TestFullPipeline(unittest.TestCase):
         payload = mock_post.call_args_list[0][1]["json"]
         self.assertIn("ask", payload["prompt"])
 
+    # --- native ---
+
+    def test_native_updates_clipboard(self):
+        unnatural = "I will do a presentation about the new feature."
+        mock_copy = self._run_process(
+            "native", unnatural,
+            ["I'll give a presentation on the new feature."],
+            "I'll give a presentation on the new feature.",
+        )
+        mock_copy.assert_called_once_with("I'll give a presentation on the new feature.")
+
+    def test_native_uses_temperature_0_3(self):
+        app = _make_app()
+        with (
+            patch("writing_tool.pyperclip.paste", return_value="unnatural phrasing"),
+            patch("writing_tool.pyperclip.copy"),
+            patch("writing_tool.notify"),
+            patch("writing_tool.pick_result", return_value="native"),
+            patch("writing_tool.requests.post",
+                  return_value=_mock_ollama_response("1. a\n\n2. b\n\n3. c")) as mock_post,
+        ):
+            app._process("native")
+        payload = mock_post.call_args_list[0][1]["json"]
+        self.assertEqual(payload["options"]["temperature"], 0.3)
+
+    def test_native_instruction_mentions_collocation(self):
+        app = _make_app()
+        with (
+            patch("writing_tool.pyperclip.paste", return_value="text"),
+            patch("writing_tool.pyperclip.copy"),
+            patch("writing_tool.notify"),
+            patch("writing_tool.pick_result", return_value="ok"),
+            patch("writing_tool.requests.post",
+                  return_value=_mock_ollama_response("1. a\n\n2. b\n\n3. c")) as mock_post,
+        ):
+            app._process("native")
+        payload = mock_post.call_args_list[0][1]["json"]
+        self.assertIn("collocation", payload["prompt"].lower())
+
 
 # ──────────────────────────────────────────────────────────────
 # Notification behaviour
@@ -428,6 +467,12 @@ class TestModesConfig(unittest.TestCase):
     def test_all_four_modes_present(self):
         for mode in ("casual", "simplify", "soften", "direct"):
             self.assertIn(mode, MODES, f"Missing mode: {mode}")
+
+    def test_native_mode_present(self):
+        self.assertIn("native", MODES)
+        self.assertEqual(MODES["native"]["label"], "Sound Native")
+        self.assertEqual(MODES["native"]["temperature"], 0.3)
+        self.assertIn("collocation", MODES["native"]["instruction"].lower())
 
     def test_all_modes_have_required_keys(self):
         for name, cfg in MODES.items():
@@ -885,6 +930,439 @@ class TestPracticeMenuIntegration(unittest.TestCase):
              patch("writing_tool.notify") as mock_notify:
             app._practice_callback(None)
         self.assertIn("disabled", mock_notify.call_args[0][1].lower())
+
+
+# ──────────────────────────────────────────────────────────────
+# CEFR level feedback
+# ──────────────────────────────────────────────────────────────
+
+class TestCEFRParse(unittest.TestCase):
+
+    def test_parse_well_formed_response(self):
+        raw = (
+            "LEVEL: B2\n"
+            "RATIONALE: Uses basic connectors but limited vocabulary range.\n"
+            "NEXT LEVEL: C1\n"
+            "SUGGESTIONS:\n"
+            "- Replace 'very good' with 'excellent' or 'outstanding'\n"
+            "- Use 'Having considered X, ...' instead of 'After I thought about X'"
+        )
+        level, rationale, next_level, suggestions = wt._parse_cefr_response(raw)
+        self.assertEqual(level, "B2")
+        self.assertEqual(next_level, "C1")
+        self.assertIn("connectors", rationale)
+        self.assertEqual(len(suggestions), 2)
+
+    def test_parse_handles_all_six_levels(self):
+        for lv in ("A1", "A2", "B1", "B2", "C1", "C2"):
+            raw = f"LEVEL: {lv}\nRATIONALE: ok\nNEXT LEVEL: {lv}\nSUGGESTIONS:\n- x"
+            level, _, _, _ = wt._parse_cefr_response(raw)
+            self.assertEqual(level, lv)
+
+    def test_parse_invalid_level_returns_none(self):
+        raw = "LEVEL: D1\nRATIONALE: ok\nNEXT LEVEL: D2\nSUGGESTIONS:\n- x"
+        level, _, next_level, _ = wt._parse_cefr_response(raw)
+        self.assertIsNone(level)
+        self.assertIsNone(next_level)
+
+    def test_parse_empty_response(self):
+        level, rationale, next_level, suggestions = wt._parse_cefr_response("")
+        self.assertIsNone(level)
+        self.assertEqual(rationale, "")
+        self.assertIsNone(next_level)
+        self.assertEqual(suggestions, [])
+
+
+class TestCEFRProgressLog(unittest.TestCase):
+
+    def test_append_writes_json_line(self):
+        import tempfile, os as _os
+        tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".jsonl")
+        tmp.close()
+        try:
+            with patch("writing_tool._PROGRESS_LOG", wt.Path(tmp.name)):
+                wt._append_progress_log("B2", "hello world")
+                wt._append_progress_log("C1", "another entry")
+            with open(tmp.name) as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 2)
+            import json as _json
+            entry = _json.loads(lines[0])
+            self.assertEqual(entry["level"], "B2")
+            self.assertEqual(entry["chars"], len("hello world"))
+            self.assertIn("date", entry)
+        finally:
+            _os.unlink(tmp.name)
+
+
+class TestCEFRPipeline(unittest.TestCase):
+
+    def test_prompt_includes_text(self):
+        with patch("writing_tool._call_model", return_value="LEVEL: B2\nRATIONALE: x\nNEXT LEVEL: C1\nSUGGESTIONS:\n- y") as mock_call, \
+             patch("writing_tool._append_progress_log"), \
+             patch("writing_tool._show_cefr_dialog"):
+            wt._run_cefr_check("sample text here")
+        prompt = mock_call.call_args[0][0]
+        self.assertIn("sample text here", prompt)
+        self.assertIn("CEFR", prompt)
+
+    def test_malformed_response_does_not_crash(self):
+        with patch("writing_tool._call_model", return_value="garbage"), \
+             patch("writing_tool._append_progress_log"), \
+             patch("writing_tool._show_cefr_dialog") as mock_dialog:
+            wt._run_cefr_check("text")
+        mock_dialog.assert_called_once()
+        args = mock_dialog.call_args[0]
+        self.assertIsNone(args[0])
+
+    def test_empty_llm_response_shows_notify(self):
+        with patch("writing_tool._call_model", return_value=""), \
+             patch("writing_tool.notify") as mock_notify, \
+             patch("writing_tool._show_cefr_dialog") as mock_dialog:
+            wt._run_cefr_check("text")
+        mock_notify.assert_called_once()
+        mock_dialog.assert_not_called()
+
+
+class TestCEFRMenuIntegration(unittest.TestCase):
+
+    def test_cefr_callback_spawns_thread(self):
+        app = _make_app()
+        spawned = []
+        def tracking_thread(*args, **kwargs):
+            spawned.append(kwargs.get("target"))
+            t = MagicMock()
+            t.start = MagicMock()
+            return t
+        with patch("writing_tool.threading.Thread", side_effect=tracking_thread), \
+             patch("writing_tool.notify"):
+            app._cefr_callback(None)
+        self.assertIn(app._process_cefr, spawned)
+
+    def test_cefr_callback_ignored_when_already_processing(self):
+        app = _make_app()
+        app.processing = True
+        spawned = []
+        def tracking_thread(*args, **kwargs):
+            spawned.append(kwargs.get("target"))
+            return MagicMock()
+        with patch("writing_tool.threading.Thread", side_effect=tracking_thread), \
+             patch("writing_tool.notify"):
+            app._cefr_callback(None)
+        self.assertEqual(spawned, [])
+
+    def test_empty_clipboard_early_return(self):
+        app = _make_app()
+        with patch("writing_tool.pyperclip.paste", return_value=""), \
+             patch("writing_tool.notify") as mock_notify, \
+             patch("writing_tool._run_cefr_check") as mock_run:
+            app._process_cefr()
+        mock_run.assert_not_called()
+        self.assertTrue(any("empty" in str(c).lower() for c in mock_notify.call_args_list))
+
+
+# ──────────────────────────────────────────────────────────────
+# Register (audience) check
+# ──────────────────────────────────────────────────────────────
+
+class TestRegisterParse(unittest.TestCase):
+
+    def test_parse_too_formal_with_swaps(self):
+        raw = (
+            'VERDICT: Too formal\n'
+            'RATIONALE: Uses email-style salutations and hedging.\n'
+            'SWAPS:\n'
+            '- "I would like to inquire" -> "quick q" — Slack peers are informal\n'
+            '- "At your earliest convenience" -> "when you get a sec" — more conversational'
+        )
+        verdict, rationale, swaps = wt._parse_register_response(raw)
+        self.assertEqual(verdict, "Too formal")
+        self.assertIn("hedging", rationale)
+        self.assertEqual(len(swaps), 2)
+        self.assertEqual(swaps[0]["original"], "I would like to inquire")
+        self.assertEqual(swaps[0]["better"], "quick q")
+        self.assertIn("informal", swaps[0]["why"])
+
+    def test_parse_matches_verdict_no_swaps(self):
+        raw = 'VERDICT: Matches\nRATIONALE: Tone fits the audience.\n'
+        verdict, rationale, swaps = wt._parse_register_response(raw)
+        self.assertEqual(verdict, "Matches")
+        self.assertEqual(swaps, [])
+
+    def test_parse_accepts_unicode_arrow(self):
+        raw = 'VERDICT: Too casual\nRATIONALE: x\nSWAPS:\n- "yo" → "Hello" — greeting'
+        _, _, swaps = wt._parse_register_response(raw)
+        self.assertEqual(len(swaps), 1)
+        self.assertEqual(swaps[0]["better"], "Hello")
+
+
+class TestRegisterPipeline(unittest.TestCase):
+
+    def test_prompt_includes_audience_and_text(self):
+        raw = 'VERDICT: Matches\nRATIONALE: ok\n'
+        with patch("writing_tool._call_model", return_value=raw) as mock_call, \
+             patch("writing_tool._show_register_dialog"), \
+             patch("writing_tool.create_anki_card"):
+            wt._run_register_check("Hey team, updates?", "Slack — peer")
+        prompt = mock_call.call_args[0][0]
+        self.assertIn("Slack — peer", prompt)
+        self.assertIn("Hey team, updates?", prompt)
+
+    def test_swaps_create_anki_cards_in_register_deck(self):
+        raw = (
+            'VERDICT: Too formal\n'
+            'RATIONALE: x\n'
+            'SWAPS:\n'
+            '- "kindly inform" -> "let me know" — friendlier\n'
+            '- "at this juncture" -> "now" — plainer'
+        )
+        with patch("writing_tool._call_model", return_value=raw), \
+             patch("writing_tool._show_register_dialog"), \
+             patch("writing_tool.create_anki_card") as mock_card:
+            wt._run_register_check("kindly inform at this juncture", "Slack — peer")
+        self.assertEqual(mock_card.call_count, 2)
+        for call in mock_card.call_args_list:
+            self.assertEqual(call.kwargs.get("deck") or call.args[2], wt.ANKI_REGISTER_DECK)
+
+    def test_matches_verdict_creates_no_cards(self):
+        raw = 'VERDICT: Matches\nRATIONALE: ok\n'
+        with patch("writing_tool._call_model", return_value=raw), \
+             patch("writing_tool._show_register_dialog"), \
+             patch("writing_tool.create_anki_card") as mock_card:
+            wt._run_register_check("text", "Slack — peer")
+        mock_card.assert_not_called()
+
+    def test_empty_llm_response_notifies(self):
+        with patch("writing_tool._call_model", return_value=""), \
+             patch("writing_tool._show_register_dialog") as mock_dialog, \
+             patch("writing_tool.notify") as mock_notify:
+            wt._run_register_check("text", "Slack — peer")
+        mock_dialog.assert_not_called()
+        mock_notify.assert_called_once()
+
+
+class TestRegisterMenuIntegration(unittest.TestCase):
+
+    def test_callback_bails_on_empty_clipboard(self):
+        app = _make_app()
+        with patch("writing_tool.pyperclip.paste", return_value=""), \
+             patch("writing_tool.notify") as mock_notify, \
+             patch("writing_tool.pick_audience") as mock_pick, \
+             patch("writing_tool.threading.Thread") as mock_thread:
+            app._register_callback(None)
+        mock_pick.assert_not_called()
+        mock_thread.assert_not_called()
+        self.assertTrue(any("empty" in str(c).lower() for c in mock_notify.call_args_list))
+
+    def test_callback_bails_on_cancelled_picker(self):
+        app = _make_app()
+        with patch("writing_tool.pyperclip.paste", return_value="hello"), \
+             patch("writing_tool.pick_audience", return_value=None), \
+             patch("writing_tool.threading.Thread") as mock_thread:
+            app._register_callback(None)
+        mock_thread.assert_not_called()
+
+    def test_callback_spawns_thread_on_valid_input(self):
+        app = _make_app()
+        spawned = []
+        def tracking_thread(*args, **kwargs):
+            spawned.append(kwargs.get("target"))
+            t = MagicMock()
+            t.start = MagicMock()
+            return t
+        with patch("writing_tool.pyperclip.paste", return_value="hello team"), \
+             patch("writing_tool.pick_audience", return_value="Slack — peer"), \
+             patch("writing_tool.threading.Thread", side_effect=tracking_thread), \
+             patch("writing_tool.notify"):
+            app._register_callback(None)
+        self.assertIn(app._process_register, spawned)
+
+
+# ──────────────────────────────────────────────────────────────
+# Daily writing prompt
+# ──────────────────────────────────────────────────────────────
+
+class TestDailyPromptBank(unittest.TestCase):
+
+    def test_bank_is_non_empty(self):
+        self.assertGreater(len(wt._DAILY_PROMPTS), 10)
+
+    def test_pick_returns_one_from_bank(self):
+        for _ in range(20):
+            prompt = wt._pick_daily_prompt()
+            self.assertIn(prompt, wt._DAILY_PROMPTS)
+
+
+class TestDailyCorrection(unittest.TestCase):
+
+    def test_correction_prompt_includes_prompt_and_response(self):
+        with patch("writing_tool._call_model", return_value="corrected text") as mock_call:
+            result = wt._correct_daily_response("Say hello", "I sayed hello")
+        self.assertEqual(result, "corrected text")
+        prompt = mock_call.call_args[0][0]
+        self.assertIn("Say hello", prompt)
+        self.assertIn("I sayed hello", prompt)
+
+    def test_correction_returns_empty_on_exception(self):
+        with patch("writing_tool._call_model", side_effect=RuntimeError("boom")):
+            result = wt._correct_daily_response("p", "r")
+        self.assertEqual(result, "")
+
+
+class TestDailyRun(unittest.TestCase):
+
+    def test_cancelled_dialog_is_no_op(self):
+        with patch("writing_tool._ask_daily_prompt_response", return_value=None), \
+             patch("writing_tool._correct_daily_response") as mock_correct, \
+             patch("writing_tool.create_anki_card") as mock_card:
+            wt._run_daily_prompt()
+        mock_correct.assert_not_called()
+        mock_card.assert_not_called()
+
+    def test_empty_response_is_no_op(self):
+        with patch("writing_tool._ask_daily_prompt_response", return_value=""), \
+             patch("writing_tool._correct_daily_response") as mock_correct:
+            wt._run_daily_prompt()
+        mock_correct.assert_not_called()
+
+    def test_full_flow_creates_anki_card_in_errors_deck(self):
+        with patch("writing_tool._pick_daily_prompt", return_value="the prompt"), \
+             patch("writing_tool._ask_daily_prompt_response", return_value="I sayed hi"), \
+             patch("writing_tool._correct_daily_response", return_value="I said hi"), \
+             patch("writing_tool.generate_explanation", return_value="- sayed → said (past tense)"), \
+             patch("writing_tool._show_daily_result_dialog"), \
+             patch("writing_tool._mark_daily_prompt_done"), \
+             patch("writing_tool.ANKI_ENABLED", True), \
+             patch("writing_tool.create_anki_card") as mock_card:
+            wt._run_daily_prompt()
+        self.assertEqual(mock_card.call_count, 1)
+        call = mock_card.call_args
+        deck = call.kwargs.get("deck") or (call.args[2] if len(call.args) > 2 else None)
+        self.assertEqual(deck, wt.ANKI_DECK)
+        self.assertEqual(call.args[0], "I sayed hi")
+
+    def test_unchanged_response_does_not_create_card(self):
+        with patch("writing_tool._pick_daily_prompt", return_value="p"), \
+             patch("writing_tool._ask_daily_prompt_response", return_value="already perfect"), \
+             patch("writing_tool._correct_daily_response", return_value="already perfect"), \
+             patch("writing_tool._show_daily_result_dialog"), \
+             patch("writing_tool._mark_daily_prompt_done"), \
+             patch("writing_tool.create_anki_card") as mock_card:
+            wt._run_daily_prompt()
+        mock_card.assert_not_called()
+
+
+class TestDailyScheduler(unittest.TestCase):
+
+    def _with_tmp_state(self):
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".state")
+        tmp.close()
+        import os as _os
+        _os.unlink(tmp.name)  # ensure it starts missing
+        return tmp.name
+
+    def test_should_fire_when_past_hour_and_not_done_today(self):
+        from datetime import datetime
+        path = self._with_tmp_state()
+        try:
+            with patch("writing_tool.DAILY_PROMPT_ENABLED", True), \
+                 patch("writing_tool.DAILY_PROMPT_HOUR", 9), \
+                 patch("writing_tool._DAILY_STATE_FILE", wt.Path(path)):
+                self.assertTrue(wt._should_fire_daily_prompt(now=datetime(2026, 4, 22, 10, 0)))
+        finally:
+            import os as _os
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_should_not_fire_before_hour(self):
+        from datetime import datetime
+        path = self._with_tmp_state()
+        try:
+            with patch("writing_tool.DAILY_PROMPT_ENABLED", True), \
+                 patch("writing_tool.DAILY_PROMPT_HOUR", 10), \
+                 patch("writing_tool._DAILY_STATE_FILE", wt.Path(path)):
+                self.assertFalse(wt._should_fire_daily_prompt(now=datetime(2026, 4, 22, 8, 0)))
+        finally:
+            import os as _os
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_should_not_fire_when_already_done_today(self):
+        from datetime import datetime
+        path = self._with_tmp_state()
+        try:
+            wt.Path(path).write_text("2026-04-22")
+            with patch("writing_tool.DAILY_PROMPT_ENABLED", True), \
+                 patch("writing_tool.DAILY_PROMPT_HOUR", 9), \
+                 patch("writing_tool._DAILY_STATE_FILE", wt.Path(path)):
+                self.assertFalse(wt._should_fire_daily_prompt(now=datetime(2026, 4, 22, 10, 0)))
+        finally:
+            import os as _os
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_should_fire_when_done_yesterday(self):
+        from datetime import datetime
+        path = self._with_tmp_state()
+        try:
+            wt.Path(path).write_text("2026-04-21")
+            with patch("writing_tool.DAILY_PROMPT_ENABLED", True), \
+                 patch("writing_tool.DAILY_PROMPT_HOUR", 9), \
+                 patch("writing_tool._DAILY_STATE_FILE", wt.Path(path)):
+                self.assertTrue(wt._should_fire_daily_prompt(now=datetime(2026, 4, 22, 10, 0)))
+        finally:
+            import os as _os
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_disabled_never_fires(self):
+        from datetime import datetime
+        path = self._with_tmp_state()
+        try:
+            with patch("writing_tool.DAILY_PROMPT_ENABLED", False), \
+                 patch("writing_tool.DAILY_PROMPT_HOUR", 0), \
+                 patch("writing_tool._DAILY_STATE_FILE", wt.Path(path)):
+                self.assertFalse(wt._should_fire_daily_prompt(now=datetime(2026, 4, 22, 23, 0)))
+        finally:
+            import os as _os
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+
+class TestDailyMenuIntegration(unittest.TestCase):
+
+    def test_callback_spawns_thread(self):
+        app = _make_app()
+        spawned = []
+        def tracking_thread(*args, **kwargs):
+            spawned.append(kwargs.get("target"))
+            t = MagicMock()
+            t.start = MagicMock()
+            return t
+        with patch("writing_tool.threading.Thread", side_effect=tracking_thread):
+            app._daily_prompt_callback(None)
+        self.assertIn(app._process_daily_prompt, spawned)
+
+    def test_tick_skips_when_should_not_fire(self):
+        app = _make_app()
+        with patch("writing_tool._should_fire_daily_prompt", return_value=False), \
+             patch("writing_tool.threading.Thread") as mock_thread:
+            app._tick_daily(None)
+        mock_thread.assert_not_called()
+
+    def test_tick_fires_when_should(self):
+        app = _make_app()
+        spawned = []
+        def tracking_thread(*args, **kwargs):
+            spawned.append(kwargs.get("target"))
+            t = MagicMock()
+            t.start = MagicMock()
+            return t
+        with patch("writing_tool._should_fire_daily_prompt", return_value=True), \
+             patch("writing_tool.threading.Thread", side_effect=tracking_thread):
+            app._tick_daily(None)
+        self.assertIn(app._process_daily_prompt, spawned)
 
 
 # ──────────────────────────────────────────────────────────────
