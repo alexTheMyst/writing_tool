@@ -45,7 +45,7 @@ TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 BACKEND = os.environ.get("BACKEND", "ollama").lower()
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 # AnkiConnect — set ANKI_ENABLED=0 to disable
 ANKI_ENABLED = os.environ.get("ANKI_ENABLED", "1") == "1"
@@ -285,6 +285,7 @@ def _call_anthropic(
         "model": ANTHROPIC_MODEL,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "output_config": {"effort": "medium"},
         "messages": [{"role": "user", "content": prompt}],
     }
     if system:
