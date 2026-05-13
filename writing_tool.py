@@ -738,22 +738,40 @@ Response: {response}\
 
 _DAILY_STATE_FILE = Path.home() / ".writing_tool_daily_state"
 
+class _SkipTodayType:
+    """Sentinel type returned by _ask_daily_prompt_response when the user picks "Skip Today"."""
+
+
+# Sentinel returned by _ask_daily_prompt_response when user picks "Skip Today".
+_SKIP_TODAY = _SkipTodayType()
+
 
 def _pick_daily_prompt() -> str:
     import random
     return random.choice(_DAILY_PROMPTS)
 
 
-def _ask_daily_prompt_response(prompt: str) -> str | None:
+def _ask_daily_prompt_response(prompt: str) -> str | None | _SkipTodayType:
+    """Show the daily prompt dialog.
+
+    Returns the user's typed response, None to retry later (Later button or Esc),
+    or _SKIP_TODAY to suppress the prompt for the rest of today.
+    """
     safe = prompt.replace("\\", "\\\\").replace('"', '\\"')
     script = (
-        f'text returned of (display dialog "{safe}" '
-        f'default answer "" with title "Writing Tool — Daily Prompt")'
+        f'set r to (display dialog "{safe}" default answer "" '
+        f'buttons {{"Skip Today", "Later", "Submit"}} default button "Submit" '
+        f'cancel button "Later" '
+        f'with title "Writing Tool — Daily Prompt")\n'
+        f'(button returned of r) & "|||" & (text returned of r)'
     )
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
+        return None  # "Later" cancel button or Esc → retry on next tick
+    btn, _, text = result.stdout.strip().partition("|||")
+    if btn == "Skip Today":
+        return _SKIP_TODAY
+    return text or None  # "Submit"
 
 
 def _correct_daily_response(prompt: str, response: str) -> str:
@@ -784,8 +802,12 @@ def _run_daily_prompt() -> None:
     try:
         prompt = _pick_daily_prompt()
         response = _ask_daily_prompt_response(prompt)
+        if response is _SKIP_TODAY:
+            logging.info("Daily prompt: user chose Skip Today")
+            _mark_daily_prompt_done()
+            return
         if not response:
-            logging.info("Daily prompt: user cancelled or empty response")
+            logging.info("Daily prompt: user chose Later or empty response")
             return
         corrected = _correct_daily_response(prompt, response)
         if not corrected:
