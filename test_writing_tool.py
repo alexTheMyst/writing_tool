@@ -1251,8 +1251,62 @@ class TestDailyRun(unittest.TestCase):
             wt._run_daily_prompt()
         mock_card.assert_not_called()
 
+    def test_skip_today_marks_done_and_skips_correction(self):
+        with patch("writing_tool._ask_daily_prompt_response", return_value=wt._SKIP_TODAY), \
+             patch("writing_tool._correct_daily_response") as mock_correct, \
+             patch("writing_tool.create_anki_card") as mock_card, \
+             patch("writing_tool._mark_daily_prompt_done") as mock_mark:
+            wt._run_daily_prompt()
+        mock_correct.assert_not_called()
+        mock_card.assert_not_called()
+        mock_mark.assert_called_once()
 
-class TestDailyScheduler(unittest.TestCase):
+    def test_later_is_no_op(self):
+        """Later button (None return) should not mark done or correct."""
+        with patch("writing_tool._ask_daily_prompt_response", return_value=None), \
+             patch("writing_tool._correct_daily_response") as mock_correct, \
+             patch("writing_tool._mark_daily_prompt_done") as mock_mark:
+            wt._run_daily_prompt()
+        mock_correct.assert_not_called()
+        mock_mark.assert_not_called()
+
+
+class TestAskDailyPromptResponse(unittest.TestCase):
+
+    def _run(self, stdout, returncode):
+        mock_result = MagicMock()
+        mock_result.stdout = stdout
+        mock_result.returncode = returncode
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            result = wt._ask_daily_prompt_response("Say hello.")
+        return result, mock_run
+
+    def test_later_button_returns_none(self):
+        result, _ = self._run("", 1)
+        self.assertIsNone(result)
+
+    def test_esc_returns_none(self):
+        result, _ = self._run("", 1)
+        self.assertIsNone(result)
+
+    def test_skip_today_returns_sentinel(self):
+        result, _ = self._run("Skip Today|||I wrote something\n", 0)
+        self.assertIs(result, wt._SKIP_TODAY)
+
+    def test_submit_returns_text(self):
+        result, _ = self._run("Submit|||Hello world\n", 0)
+        self.assertEqual(result, "Hello world")
+
+    def test_submit_empty_text_returns_none(self):
+        result, _ = self._run("Submit|||\n", 0)
+        self.assertIsNone(result)
+
+    def test_response_containing_separator_is_handled(self):
+        # text may contain ||| after the first partition — should still work
+        result, _ = self._run("Submit|||foo|||bar\n", 0)
+        self.assertEqual(result, "foo|||bar")
+
+
 
     def _with_tmp_state(self):
         import tempfile
