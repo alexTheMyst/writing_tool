@@ -738,8 +738,12 @@ Response: {response}\
 
 _DAILY_STATE_FILE = Path.home() / ".writing_tool_daily_state"
 
+class _SkipTodayType:
+    """Sentinel type returned by _ask_daily_prompt_response when the user picks "Skip Today"."""
+
+
 # Sentinel returned by _ask_daily_prompt_response when user picks "Skip Today".
-_SKIP_TODAY = object()
+_SKIP_TODAY = _SkipTodayType()
 
 
 def _pick_daily_prompt() -> str:
@@ -747,7 +751,7 @@ def _pick_daily_prompt() -> str:
     return random.choice(_DAILY_PROMPTS)
 
 
-def _ask_daily_prompt_response(prompt: str) -> str | None:
+def _ask_daily_prompt_response(prompt: str) -> str | None | _SkipTodayType:
     """Show the daily prompt dialog.
 
     Returns the user's typed response, None to retry later (Later button or Esc),
