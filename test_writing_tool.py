@@ -705,6 +705,46 @@ class TestAnthropicBackend(unittest.TestCase):
         self.assertEqual(max_tokens, 512)
 
 
+class TestAnthropicPayload(unittest.TestCase):
+
+    def _mock_anthropic_response(self, text="ok"):
+        response = MagicMock()
+        response.content = [MagicMock(text=text)]
+        return response
+
+    @patch("anthropic.Anthropic")
+    def test_haiku_request_omits_effort_config(self, mock_client_cls):
+        mock_client = mock_client_cls.return_value
+        mock_client.messages.create.return_value = self._mock_anthropic_response("haiku ok")
+
+        with patch("writing_tool.ANTHROPIC_MODEL", "claude-haiku-4-5"):
+            result = wt._call_anthropic("prompt", None, 0.5, 512)
+
+        self.assertEqual(result, "haiku ok")
+        kwargs = mock_client.messages.create.call_args[1]
+        self.assertEqual(kwargs["model"], "claude-haiku-4-5")
+        self.assertEqual(kwargs["max_tokens"], 512)
+        self.assertEqual(kwargs["temperature"], 0.5)
+        self.assertNotIn("output_config", kwargs)
+        self.assertNotIn("system", kwargs)
+
+    @patch("anthropic.Anthropic")
+    def test_sonnet_request_omits_effort_config_and_keeps_system(self, mock_client_cls):
+        mock_client = mock_client_cls.return_value
+        mock_client.messages.create.return_value = self._mock_anthropic_response("sonnet ok")
+
+        with patch("writing_tool.ANTHROPIC_MODEL", "claude-sonnet-4-6"):
+            result = wt._call_anthropic("prompt", "sys", 0.3, 1024)
+
+        self.assertEqual(result, "sonnet ok")
+        kwargs = mock_client.messages.create.call_args[1]
+        self.assertEqual(kwargs["model"], "claude-sonnet-4-6")
+        self.assertEqual(kwargs["max_tokens"], 1024)
+        self.assertEqual(kwargs["temperature"], 0.3)
+        self.assertEqual(kwargs["system"], "sys")
+        self.assertNotIn("output_config", kwargs)
+
+
 # ──────────────────────────────────────────────────────────────
 # fetch_deck_cards() — AnkiConnect integration
 # ──────────────────────────────────────────────────────────────

@@ -102,7 +102,7 @@ A **✎** icon appears in the menu bar. No Accessibility permission required.
 | `OPENAI_API_KEY` | *(required)* | OpenAI API key — required when `BACKEND=openai` |
 | `OPENAI_MODEL` | `gpt-4o` | OpenAI model name |
 | `ANTHROPIC_API_KEY` | *(required)* | Anthropic API key — required when `BACKEND=anthropic` |
-| `ANTHROPIC_MODEL` | `claude-3-5-sonnet-20241022` | Anthropic model name |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Anthropic model name |
 | `ANKI_ENABLED` | `1` | Set to `0` to disable Anki integration |
 | `ANKI_URL` | `http://127.0.0.1:8765` | AnkiConnect plugin URL |
 | `ANKI_DECK` | `Writing Errors` | Deck for grammar/style correction cards |
@@ -112,6 +112,8 @@ A **✎** icon appears in the menu bar. No Accessibility permission required.
 | `ANKI_TIMEOUT` | `5` | AnkiConnect request timeout in seconds |
 | `DAILY_PROMPT_ENABLED` | `1` | Set to `0` to disable the automatic daily writing prompt |
 | `DAILY_PROMPT_HOUR` | `10` | Local time hour (0–23) when the daily prompt fires automatically |
+
+Anthropic compatibility note: requests intentionally omit model-specific `effort` controls so Haiku and Sonnet models both work. If you add Anthropic-only tuning fields later, gate them by model capability first.
 
 ## Anki integration
 

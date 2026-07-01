@@ -285,7 +285,6 @@ def _call_anthropic(
         "model": ANTHROPIC_MODEL,
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "output_config": {"effort": "medium"},
         "messages": [{"role": "user", "content": prompt}],
     }
     if system:
