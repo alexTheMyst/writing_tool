@@ -1187,10 +1187,10 @@ class TestRegisterMenuIntegration(unittest.TestCase):
         app = _make_app()
         with patch("writing_tool.pyperclip.paste", return_value=""), \
              patch("writing_tool.notify") as mock_notify, \
-             patch("writing_tool.pick_audience") as mock_pick, \
+             patch("writing_tool.pick_audience", return_value="Slack — peer") as mock_pick, \
              patch("writing_tool.threading.Thread") as mock_thread:
             app._register_callback(None)
-        mock_pick.assert_not_called()
+        mock_pick.assert_called_once()
         mock_thread.assert_not_called()
         self.assertTrue(any("empty" in str(c).lower() for c in mock_notify.call_args_list))
 

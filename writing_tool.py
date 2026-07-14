@@ -8,6 +8,7 @@ Workflow: Copy text → click menu bar icon (✎) → select mode → paste impr
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import threading
@@ -55,6 +56,9 @@ ANKI_VOCAB_DECK = os.environ.get("ANKI_VOCAB_DECK", "English Vocabulary")
 ANKI_EXERCISE_DECK = os.environ.get("ANKI_EXERCISE_DECK", "Writing Exercises")
 ANKI_REGISTER_DECK = os.environ.get("ANKI_REGISTER_DECK", "Register Notes")
 ANKI_TIMEOUT = int(os.environ.get("ANKI_TIMEOUT", "5"))
+
+# Maximum clipboard characters sent to LLM (prevents accidental large-paste costs)
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
 
 # Daily writing prompt: set DAILY_PROMPT_ENABLED=0 to disable the scheduled prompt.
 # DAILY_PROMPT_HOUR is local-time 0–23 — the timer fires once on/after this hour each day.
@@ -142,10 +146,14 @@ MODES = {
 # macOS notification helper
 # ──────────────────────────────────────────────────────────────
 
+def _escape_for_applescript(s: str) -> str:
+    """Escape a string for safe inclusion in an AppleScript string literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
 def notify(title: str, message: str) -> None:
     """Send a macOS notification via osascript."""
-    safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
-    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+    safe_msg = _escape_for_applescript(message)
+    safe_title = _escape_for_applescript(title)
     script = f'display notification "{safe_msg}" with title "{safe_title}"'
     subprocess.run(["osascript", "-e", script], capture_output=True)
 
@@ -156,9 +164,7 @@ def pick_result(options: list) -> str | None:
         f"{i + 1}. {opt[:80]}{'…' if len(opt) > 80 else ''}"
         for i, opt in enumerate(options)
     ]
-    def esc(s):
-        return s.replace("\\", "\\\\").replace('"', '\\"')
-    as_list = "{" + ", ".join(f'"{esc(l)}"' for l in labels) + "}"
+    as_list = "{" + ", ".join(f'"{_escape_for_applescript(l)}"' for l in labels) + "}"
     script = (
         f'choose from list {as_list} '
         f'with prompt "Pick a version:" '
@@ -185,9 +191,7 @@ _AUDIENCES = [
 
 def pick_audience() -> str | None:
     """Show a native macOS list picker for audience selection, or None if cancelled."""
-    def esc(s):
-        return s.replace("\\", "\\\\").replace('"', '\\"')
-    as_list = "{" + ", ".join(f'"{esc(a)}"' for a in _AUDIENCES) + "}"
+    as_list = "{" + ", ".join(f'"{_escape_for_applescript(a)}"' for a in _AUDIENCES) + "}"
     script = (
         f'choose from list {as_list} '
         f'with prompt "Who is the audience?" '
@@ -235,8 +239,8 @@ def _call_ollama(
     if system:
         payload["system"] = system
     try:
-        logging.debug("POST %s (timeout=%ds)", OLLAMA_URL, TIMEOUT)
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
+        logging.debug("POST %s", OLLAMA_URL)
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=(10, TIMEOUT))
         resp.raise_for_status()
         result = resp.json().get("response", "").strip()
         logging.debug("Ollama responded: %r", result[:120])
@@ -253,6 +257,8 @@ def _call_openai(
     max_tokens: int,
 ) -> str:
     import openai  # lazy import — only required when BACKEND=openai
+    if not os.environ.get("OPENAI_API_KEY"):
+        logging.error("OPENAI_API_KEY is not set; OpenAI calls will fail")
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -280,6 +286,8 @@ def _call_anthropic(
     max_tokens: int,
 ) -> str:
     import anthropic  # lazy import — only required when BACKEND=anthropic
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logging.error("ANTHROPIC_API_KEY is not set; Anthropic calls will fail")
     client = anthropic.Anthropic()
     kwargs = {
         "model": ANTHROPIC_MODEL,
@@ -358,7 +366,7 @@ Original:
 {original}
 
 Corrected:
-{corrected}\
+{corrected}
 """
 
 _NUANCE_PROMPT = """\
@@ -376,7 +384,7 @@ For each one output a single bullet:
 - <exact phrase as it appears> — <meaning>
 
 Text:
-{text}\
+{text}
 """
 
 
@@ -505,7 +513,7 @@ SUGGESTIONS:
 - ... (2-3 suggestions total)
 
 Text:
-{text}\
+{text}
 """
 
 _CEFR_LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
@@ -572,7 +580,7 @@ def _show_cefr_dialog(level: str | None, rationale: str, next_level: str | None,
         for s in suggestions:
             body_lines.append(f"• {s}")
     body = "\n".join(body_lines)
-    safe = body.replace("\\", "\\\\").replace('"', '\\"')
+    safe = _escape_for_applescript(body)
     script = f'display dialog "{safe}" with title "Writing Tool — CEFR Level" buttons {{"OK"}} default button "OK"'
     subprocess.run(["osascript", "-e", script], capture_output=True)
 
@@ -607,7 +615,7 @@ VERDICT: <Too formal | Matches | Too casual>
 RATIONALE: <one short sentence>
 SWAPS:
 - "<phrase from text>" -> "<better phrase>" — <why>
-- ... (0-3 swaps total; omit the SWAPS section entirely if VERDICT is Matches)\
+- ... (0-3 swaps total; omit the SWAPS section entirely if VERDICT is Matches)
 """
 
 _REGISTER_VERDICTS = ("Too formal", "Matches", "Too casual")
@@ -663,7 +671,7 @@ def _show_register_dialog(audience: str, verdict: str | None, rationale: str, sw
             tail = f" — {s['why']}" if s['why'] else ""
             lines.append(f'• "{s["original"]}" → "{s["better"]}"{tail}')
     body = "\n".join(lines)
-    safe = body.replace("\\", "\\\\").replace('"', '\\"')
+    safe = _escape_for_applescript(body)
     script = f'display dialog "{safe}" with title "Writing Tool — Register" buttons {{"OK"}} default button "OK"'
     subprocess.run(["osascript", "-e", script], capture_output=True)
 
@@ -732,7 +740,7 @@ If the response is already correct, return it unchanged.
 
 Prompt: {prompt}
 
-Response: {response}\
+Response: {response}
 """
 
 _DAILY_STATE_FILE = Path.home() / ".writing_tool_daily_state"
@@ -741,12 +749,10 @@ class _SkipTodayType:
     """Sentinel type returned by _ask_daily_prompt_response when the user picks "Skip Today"."""
 
 
-# Sentinel returned by _ask_daily_prompt_response when user picks "Skip Today".
 _SKIP_TODAY = _SkipTodayType()
 
 
 def _pick_daily_prompt() -> str:
-    import random
     return random.choice(_DAILY_PROMPTS)
 
 
@@ -756,7 +762,7 @@ def _ask_daily_prompt_response(prompt: str) -> str | None | _SkipTodayType:
     Returns the user's typed response, None to retry later (Later button or Esc),
     or _SKIP_TODAY to suppress the prompt for the rest of today.
     """
-    safe = prompt.replace("\\", "\\\\").replace('"', '\\"')
+    safe = _escape_for_applescript(prompt)
     script = (
         f'set r to (display dialog "{safe}" default answer "" '
         f'buttons {{"Skip Today", "Later", "Submit"}} default button "Submit" '
@@ -792,7 +798,7 @@ def _show_daily_result_dialog(prompt: str, original: str, corrected: str, explan
         lines.append("Changes:")
         lines.append(explanation)
     body = "\n".join(lines)
-    safe = body.replace("\\", "\\\\").replace('"', '\\"')
+    safe = _escape_for_applescript(body)
     script = f'display dialog "{safe}" with title "Writing Tool — Daily Review" buttons {{"OK"}} default button "OK"'
     subprocess.run(["osascript", "-e", script], capture_output=True)
 
@@ -941,7 +947,7 @@ If fewer than 3 cards are provided, still try to identify any patterns you can.
 If no clear patterns exist, output exactly: NO_PATTERNS
 
 Cards:
-{cards_text}\
+{cards_text}
 """
 
 
@@ -977,7 +983,7 @@ FIXED: <corrected sentence>
 HINT: <short hint about what to look for>
 
 Error patterns:
-{patterns}\
+{patterns}
 """
 
 
@@ -1187,6 +1193,9 @@ class WritingToolApp(rumps.App):
                 logging.warning("Clipboard is empty")
                 notify("Writing Tool", "Clipboard is empty — copy some text first.")
                 return
+            if len(text) > MAX_INPUT_CHARS:
+                notify("Writing Tool", f"Text too long ({len(text)} chars). Copy a shorter passage (max {MAX_INPUT_CHARS}).")
+                return
             logging.info("Running CEFR check: chars=%d", len(text))
             _run_cefr_check(text)
         except Exception:
@@ -1225,13 +1234,13 @@ class WritingToolApp(rumps.App):
 
     def _register_callback(self, sender):
         logging.info("Menu clicked: Check Register")
-        text = pyperclip.paste()
-        if not text or not text.strip():
-            notify("Writing Tool", "Clipboard is empty — copy some text first.")
-            return
         audience = pick_audience()
         if not audience:
             logging.info("Register: user cancelled audience picker")
+            return
+        text = pyperclip.paste()
+        if not text or not text.strip():
+            notify("Writing Tool", "Clipboard is empty — copy some text first.")
             return
         with self.lock:
             if self.processing:
@@ -1280,10 +1289,13 @@ class WritingToolApp(rumps.App):
     def _process_learn(self):
         try:
             text = pyperclip.paste()
-            logging.debug("Clipboard contents (%d chars): %r", len(text or ""), (text or "")[:120])
+            logging.debug("Clipboard has %d chars", len(text or ""))
             if not text or not text.strip():
                 logging.warning("Clipboard is empty")
                 notify("Writing Tool", "Clipboard is empty — copy some text first.")
+                return
+            if len(text) > MAX_INPUT_CHARS:
+                notify("Writing Tool", f"Text too long ({len(text)} chars). Copy a shorter passage (max {MAX_INPUT_CHARS}).")
                 return
             logging.info("Generating nuance explanation: chars=%d", len(text))
             _run_learn_card(text)
@@ -1302,10 +1314,13 @@ class WritingToolApp(rumps.App):
             temperature = 0.5
         try:
             original = pyperclip.paste()
-            logging.debug("Clipboard contents (%d chars): %r", len(original or ""), (original or "")[:120])
+            logging.debug("Clipboard has %d chars", len(original or ""))
             if not original or not original.strip():
                 logging.warning("Clipboard is empty")
                 notify("Writing Tool", "Clipboard is empty — copy some text first.")
+                return
+            if len(original) > MAX_INPUT_CHARS:
+                notify("Writing Tool", f"Text too long ({len(original)} chars). Copy a shorter passage (max {MAX_INPUT_CHARS}).")
                 return
             logging.info("Sending to LLM backend=%s mode=%s chars=%d", BACKEND, mode_name or "custom", len(original))
             variants = rewrite_multiple(original, instruction, n=3, temperature=temperature)
